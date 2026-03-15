@@ -1,0 +1,5 @@
+add_library(gguf_kernels STATIC dequantize.cu)
+target_link_libraries(gguf_kernels PUBLIC ${CUDA_LIBRARIES})
+target_include_directories(gguf_kernels PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+set_property(TARGET gguf_kernels PROPERTY CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+set_property(TARGET gguf_kernels PROPERTY POSITION_INDEPENDENT_CODE ON)
