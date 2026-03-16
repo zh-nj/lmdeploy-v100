@@ -164,21 +164,18 @@ class TurboMind:
 
         if not osp.exists(model_path):
             model_path = get_model(model_path, _engine_config.download_dir, _engine_config.revision)
-        logger.info(f'TurboMind: starting _from_hf for {model_path}')
         self.model_comm = self._from_hf(model_path=model_path, engine_config=_engine_config)
-        logger.info('TurboMind: _from_hf done')
         self.is_dummy = self.model_comm.is_dummy_node()
-        logger.info('TurboMind: creating Tokenizer')
         self.tokenizer = Tokenizer(model_path)
-        logger.info('TurboMind: Tokenizer created')
         if not _engine_config.empty_init:
-            logger.info('TurboMind: loading weights')
             self._load_weights()
-            logger.info('TurboMind: processing weights')
             self._process_weights()
-            logger.info('TurboMind: creating engine')
+            # Release PyTorch CUDA allocator cache accumulated during
+            # process_weights (C++ Convert) on all GPUs.
+            for dev in self.devices:
+                with torch.cuda.device(dev):
+                    torch.cuda.empty_cache()
             self._create_engine()
-            logger.info('TurboMind: engine created')
 
         self.session_len = self.config.session_len
 
