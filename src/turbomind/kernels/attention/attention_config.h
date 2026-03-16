@@ -76,7 +76,7 @@ struct AttentionConfig<arch::Sm75, T, HeadDim, Ctype>: Base_64x64_16x64 {
 // Toggle: set to 1 to use MMA_884 for sm70 prefill,
 //         set to 0 to fall back to MMA_SIMT
 #ifndef SM70_PREFILL_USE_MMA_884
-#define SM70_PREFILL_USE_MMA_884 0
+#define SM70_PREFILL_USE_MMA_884 1
 #endif
 
 template<class T, int HeadDim, CacheType Ctype>

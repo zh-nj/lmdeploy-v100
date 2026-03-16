@@ -74,7 +74,7 @@ struct DecodingConfig<arch::Sm75, T, Tkv, Qh_, HeadDim, std::enable_if_t<(HeadDi
 // Toggle: set to 1 to use MMA_884_DEC for sm70 decode (Tkv=T, HeadDim!=256),
 //         set to 0 to fall back to MMA_SIMT
 #ifndef SM70_DECODE_USE_MMA_884
-#define SM70_DECODE_USE_MMA_884 0
+#define SM70_DECODE_USE_MMA_884 1
 #endif
 
 // sm70 decode with fp16 KV cache (Tkv=T): MMA_884_DEC when enabled, else MMA_SIMT
