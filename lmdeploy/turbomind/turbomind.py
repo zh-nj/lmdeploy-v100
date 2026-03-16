@@ -195,6 +195,11 @@ class TurboMind:
 
         with torch.cuda.device(self.devices[0]):
             self._tm_model.export()
+            # Release PyTorch CUDA allocator cache accumulated during
+            # export_weight() .cuda() calls on GPU0. Without this, the
+            # cached memory reduces available space for KV cache (which
+            # uses AllReduce(min) across GPUs).
+            torch.cuda.empty_cache()
 
         self._check_unloaded_tm_params()
 

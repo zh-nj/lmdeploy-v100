@@ -313,12 +313,31 @@ class Qwen3VLModel(VisionModel):
             logger.warning(f'Vision model unexpected keys: {unexpected}')
 
         self.model = vision_model.half().eval()
-        # Move to GPU
-        if self.max_memory:
-            device = list(self.max_memory.keys())[0]
+        # Distribute vision encoder across available GPUs using accelerate,
+        # matching the pattern in build_model() for standard Qwen3VL.
+        # This avoids putting the entire ~910 MB encoder on GPU0 only,
+        # which wastes KV cache capacity (AllReduce(min) across GPUs).
+        if self.max_memory and len(self.max_memory) > 1:
+            from accelerate import dispatch_model
+            from accelerate.utils import (get_balanced_memory,
+                                          infer_auto_device_map)
+            max_memory = get_balanced_memory(
+                self.model,
+                max_memory=self.max_memory,
+                dtype=torch.half,
+                no_split_module_classes=['Qwen3VLVisionBlock'])
+            device_map = infer_auto_device_map(
+                self.model,
+                max_memory=max_memory,
+                no_split_module_classes=['Qwen3VLVisionBlock'],
+                dtype=torch.half)
+            self.model = dispatch_model(self.model, device_map=device_map)
         else:
-            device = 'cuda'
-        self.model = self.model.to(device)
+            if self.max_memory:
+                device = list(self.max_memory.keys())[0]
+            else:
+                device = 'cuda'
+            self.model = self.model.to(device)
 
 
     @torch.no_grad()
