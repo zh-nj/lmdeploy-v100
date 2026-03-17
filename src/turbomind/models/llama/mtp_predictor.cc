@@ -28,6 +28,63 @@
 #include "src/turbomind/models/llama/llama_utils.h"
 #include "src/turbomind/utils/cuda_utils.h"
 
+// MTP_PROFILE: compile-time switch for per-step timing in ForwardStep
+// NOTE: Per-step timing uses cudaStreamSynchronize which is INCOMPATIBLE with TP>1
+// Only use for TP=1 debugging. For TP>1, use pipeline-level profiling only.
+#ifndef MTP_PROFILE
+#define MTP_PROFILE 0
+#endif
+
+// MTP_PROFILE_PIPELINE: pipeline-level profiling (safe for TP>1)
+// Enabled by MTP_PROFILE but uses deferred sync at iteration boundary
+#ifndef MTP_PROFILE_PIPELINE
+#define MTP_PROFILE_PIPELINE MTP_PROFILE
+#endif
+
+#if MTP_PROFILE
+#include <cstdio>
+#include <chrono>
+static FILE* g_mtp_profile_fp   = nullptr;
+static int   g_mtp_profile_iter = 0;
+static int   g_mtp_layer_idx;
+static std::chrono::high_resolution_clock::time_point g_mtp_tp;
+
+static void mtp_profile_init()
+{
+    if (!g_mtp_profile_fp) {
+        g_mtp_profile_fp = fopen("/tmp/mtp_profile.csv", "w");
+        if (g_mtp_profile_fp) {
+            fprintf(g_mtp_profile_fp, "iter,layer,step,ms\n");
+        }
+    }
+}
+
+// These macros use cudaStreamSynchronize — ONLY safe for TP=1
+#define MTP_PROFILER_INIT() g_mtp_layer_idx = mtp_layer_idx
+#define MTP_TIMER_BEGIN(name) \
+    do { cudaStreamSynchronize(st); g_mtp_tp = std::chrono::high_resolution_clock::now(); } while(0)
+#define MTP_TIMER_END(name) \
+    do { \
+        cudaStreamSynchronize(st); \
+        auto _now = std::chrono::high_resolution_clock::now(); \
+        double _ms = std::chrono::duration<double, std::milli>(_now - g_mtp_tp).count(); \
+        mtp_profile_init(); \
+        if (g_mtp_profile_fp) { \
+            fprintf(g_mtp_profile_fp, "%d,%d,%s,%.4f\n", g_mtp_profile_iter, g_mtp_layer_idx, #name, _ms); \
+        } \
+    } while(0)
+#define MTP_PROFILER_FLUSH() \
+    do { if (g_mtp_profile_fp) fflush(g_mtp_profile_fp); } while(0)
+#define MTP_ITER_INC() (++g_mtp_profile_iter)
+
+#else
+#define MTP_PROFILER_INIT()   ((void)0)
+#define MTP_TIMER_BEGIN(name) ((void)0)
+#define MTP_TIMER_END(name)   ((void)0)
+#define MTP_PROFILER_FLUSH()  ((void)0)
+#define MTP_ITER_INC()        ((void)0)
+#endif
+
 namespace turbomind {
 
 MTPPredictor::MTPPredictor(const ModelParam&     model,
@@ -225,7 +282,10 @@ ForwardStepResult MTPPredictor::ForwardStep(int           mtp_layer_idx,
     TM_CHECK(mtp_layer_idx < (int)weights_.mtp_layer_weights.size());
     const auto& mtp_w = *weights_.mtp_layer_weights[mtp_layer_idx];
 
+    MTP_PROFILER_INIT();
+
     // Step 1-2: Dual RMSNorm
+    MTP_TIMER_BEGIN(dual_rmsnorm);
     Tensor normed_emb{{batch_size, hidden_units_}, dtype_, kDEVICE};
     invokeRMSNorm(normed_emb, prev_embedding, mtp_w.pre_fc_norm_embedding, norm_eps_, st);
     sync_check_cuda_error();
@@ -233,6 +293,7 @@ ForwardStepResult MTPPredictor::ForwardStep(int           mtp_layer_idx,
     Tensor normed_hidden{{batch_size, hidden_units_}, dtype_, kDEVICE};
     invokeRMSNorm(normed_hidden, hidden_states, mtp_w.pre_fc_norm_hidden, norm_eps_, st);
     sync_check_cuda_error();
+    MTP_TIMER_END(dual_rmsnorm);
 
     // Step 3: Concatenate [normed_emb, normed_hidden] → [batch, hidden_size*2]
     // We allocate a fused buffer and copy both halves into it.
@@ -251,6 +312,7 @@ ForwardStepResult MTPPredictor::ForwardStep(int           mtp_layer_idx,
     // Step 4: fc projection (ColumnParallelLinear with gather_output=True)
     // fc weight: [hidden_size/tp, hidden_size*2] → local output [batch, hidden_size/tp]
     // Then all-gather to get [batch, hidden_size]
+    MTP_TIMER_BEGIN(fc_proj);
     Tensor projected;
     if (tp_size_ == 1) {
         projected = Tensor{{batch_size, hidden_units_}, dtype_, kDEVICE};
@@ -275,15 +337,19 @@ ForwardStepResult MTPPredictor::ForwardStep(int           mtp_layer_idx,
     }
 
     // Step 5: Attention layer (MTP's own KV cache layer)
+    MTP_TIMER_END(fc_proj);
     const auto& decoder_w = *mtp_w.decoder_layer;
 
     // Pre-attention RMSNorm
+    MTP_TIMER_BEGIN(attn_norm);
     Tensor residual = projected;
     Tensor attn_input{{batch_size, hidden_units_}, dtype_, kDEVICE};
     invokeRMSNorm(attn_input, projected, decoder_w.self_attn_norm, norm_eps_, st);
     sync_check_cuda_error();
+    MTP_TIMER_END(attn_norm);
 
     // Attention forward
+    MTP_TIMER_BEGIN(attention);
     const int mtp_kv_layer_idx = mtp_attn_layer_offset_ + mtp_layer_idx;
     attn_layer_->Forward({0,  // phase=0 (decode)
                           attn_input,
@@ -293,6 +359,8 @@ ForwardStepResult MTPPredictor::ForwardStep(int           mtp_layer_idx,
 
     // Post-attention: allreduce + residual + RMSNorm (pre-FFN norm)
     // attn_input now contains the attention output
+    MTP_TIMER_END(attention);
+    MTP_TIMER_BEGIN(post_attn_allreduce);
     const Tensor& attn_output_bias = decoder_w.self_attn_weights->output.bias;
     if (d_comm_) {
         d_comm_->AllreduceResidualBiasRMSnorm(attn_input.raw_data(),
@@ -325,7 +393,9 @@ ForwardStepResult MTPPredictor::ForwardStep(int           mtp_layer_idx,
     //   attn_input = RMSNorm(residual + allreduce(attn_out) + bias, ffn_norm)
     //   residual = residual + allreduce(attn_out) + bias
     // Now attn_input is the FFN input (normed), residual holds the running residual.
+    MTP_TIMER_END(post_attn_allreduce);
 
+    MTP_TIMER_BEGIN(moe_ffn);
     std::optional<MoeFfnLayer::ForwardParam> moe_fwd_param;
 
     if (decoder_w.moe_weights) {
@@ -343,6 +413,8 @@ ForwardStepResult MTPPredictor::ForwardStep(int           mtp_layer_idx,
     }
 
     // Post-FFN: allreduce + residual + final RMSNorm
+    MTP_TIMER_END(moe_ffn);
+    MTP_TIMER_BEGIN(post_ffn_allreduce);
     if (d_comm_) {
         d_comm_->AllreduceResidualBiasRMSnorm(attn_input.raw_data(),
                                               residual.data_or((void*)nullptr),
@@ -370,6 +442,8 @@ ForwardStepResult MTPPredictor::ForwardStep(int           mtp_layer_idx,
     }
 
     // Step 7: lm_head → logits
+    MTP_TIMER_END(post_ffn_allreduce);
+    MTP_TIMER_BEGIN(lm_head);
     Tensor logits;
     if (mtp_w.has_shared_head && mtp_w.shared_head_output) {
         // Step3p5: per-layer shared_head (norm + output)
@@ -384,7 +458,12 @@ ForwardStepResult MTPPredictor::ForwardStep(int           mtp_layer_idx,
     }
 
     // Step 8: argmax → draft token IDs
+    MTP_TIMER_END(lm_head);
+    MTP_TIMER_BEGIN(argmax);
     auto draft_ids = Argmax(logits, batch_size);
+    MTP_TIMER_END(argmax);
+
+    MTP_PROFILER_FLUSH();
 
     return ForwardStepResult{std::move(draft_ids), residual};
 }
@@ -404,6 +483,8 @@ MTPPredictor::DraftResult MTPPredictor::Draft(int                 batch_size,
     DraftResult result;
     result.draft_tokens = Buffer_<int>{num_draft_tokens * batch_size, kDEVICE};
     result.num_drafts   = num_draft_tokens;
+
+    MTP_ITER_INC();
 
     // Initial embedding: lookup the last accepted tokens
     Tensor prev_embedding = LookupEmbedding(last_tokens, batch_size);

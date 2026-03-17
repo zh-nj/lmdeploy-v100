@@ -65,8 +65,9 @@ MoeFfnLayer::MoeFfnLayer(const ModelParam& model, const MoeParam& param, const E
     accum_   = {max_expert_num * kMoeGateMaxTiles, kDEVICE};
 
     if (param_.method != MoeParam::kFused) {
-        const int max_moe_tokens = max_token_num * param_.experts_per_token;
-        inter_buf_ = Tensor{{max_moe_tokens, inter_size_ * 2}, kFloat16, kDEVICE};
+        // inter_buf_ was previously pre-allocated here but never used in Forward().
+        // Forward() creates its own local `inter` tensor via the stack allocator.
+        // Removed to save ~384MB on 122B TP=8 (max_moe_tokens * inter_size * 2 * 2B).
     }
 
     // cuBLAS handle for fp32 gate matmul

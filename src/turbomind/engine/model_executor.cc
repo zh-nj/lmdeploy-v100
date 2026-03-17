@@ -11,6 +11,56 @@
 #include "src/turbomind/models/llama/llama_utils.h"
 #include "src/turbomind/utils/anomaly_handler.h"
 
+#ifndef MTP_PROFILE_PIPELINE
+#define MTP_PROFILE_PIPELINE 0
+#endif
+
+#if MTP_PROFILE_PIPELINE
+#include <cstdio>
+#include <chrono>
+
+static FILE* g_pipeline_fp   = nullptr;
+static int   g_pipeline_iter = 0;
+
+static void pipeline_profile_init()
+{
+    if (!g_pipeline_fp) {
+        g_pipeline_fp = fopen("/tmp/mtp_pipeline.csv", "w");
+        if (g_pipeline_fp) {
+            fprintf(g_pipeline_fp, "iter,step,wall_ms\n");
+        }
+    }
+}
+
+// Wall-clock profiler: no CUDA sync, measures host-side submission time
+// For accurate GPU timing, use nsys/nvprof instead
+struct PipelineProfiler {
+    int iter;
+    std::chrono::high_resolution_clock::time_point tp;
+    const char* current_name;
+
+    PipelineProfiler(int it) : iter(it), current_name(nullptr) {}
+
+    void Begin(const char* name) {
+        current_name = name;
+        tp = std::chrono::high_resolution_clock::now();
+    }
+
+    void End() {
+        auto now = std::chrono::high_resolution_clock::now();
+        double ms = std::chrono::duration<double, std::milli>(now - tp).count();
+        pipeline_profile_init();
+        if (g_pipeline_fp && current_name) {
+            fprintf(g_pipeline_fp, "%d,%s,%.4f\n", iter, current_name, ms);
+        }
+    }
+
+    void Flush() {
+        if (g_pipeline_fp) fflush(g_pipeline_fp);
+    }
+};
+#endif
+
 // #include "dbg.h"
 
 namespace turbomind {
@@ -110,6 +160,46 @@ struct ModelExecutor::Impl {
 
         TensorMap env{{"batch", d.buf()}};
 
+#if MTP_PROFILE_PIPELINE
+        ++g_pipeline_iter;
+        PipelineProfiler prof(g_pipeline_iter);
+
+        // 1. Forward (K+1 tokens/req)
+        prof.Begin("forward_prepare");
+        BatchCopy copy;
+        env["copy"] = copy.buf();
+        model_.Run(BatchOp::kPrepare, d.phase, env);
+        copy.Run();
+        prof.End();
+
+        prof.Begin("forward_compute");
+        model_.Run(BatchOp::kForward, d.phase, env);
+        prof.End();
+
+        prof.Begin("forward_unprep");
+        model_.Run(BatchOp::kUnprep, d.phase, env);
+        copy.Run();
+        prof.End();
+
+        // 2. Reject
+        prof.Begin("reject");
+        model_.Run(BatchOp::kReject, d.phase, env);
+        prof.End();
+
+        // 3. Rollback
+        prof.Begin("rollback");
+        model_.Run(BatchOp::kRollback, d.phase, env);
+        prof.End();
+
+        // 4. Draft
+        prof.Begin("draft");
+        env["block_ptrs"]         = d.spec_block_ptrs;
+        env["block_ptrs_offsets"] = d.spec_block_ptrs_offsets;
+        model_.Run(BatchOp::kDraft, d.phase, env);
+        prof.End();
+
+        prof.Flush();
+#else
         // 1. Normal Prepare → Forward → Unprep (K+1 tokens/req, prefill-like)
         BatchCopy copy;
         env["copy"] = copy.buf();
@@ -130,6 +220,7 @@ struct ModelExecutor::Impl {
         env["block_ptrs"]         = d.spec_block_ptrs;
         env["block_ptrs_offsets"] = d.spec_block_ptrs_offsets;
         model_.Run(BatchOp::kDraft, d.phase, env);
+#endif
 
         AnomalyHandler::instance().Summarize([](...) {});
         AnomalyHandler::instance().Reset();
