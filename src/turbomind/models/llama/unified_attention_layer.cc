@@ -266,18 +266,23 @@ void UnifiedAttentionLayer::Setup(int phase, TensorMap& env)
     // Detect uniform small prefill: all requests have same input_len > 1 and input_len <= threshold.
     // Reclassify as multi-token decode to use decode kernel (split-k, no ProcessKV/FlattenKV).
     //
-    // This includes speculative verification batches (bonus + K drafts, input_len=K+1).
-    // MTD uses decode kernel with split-k which may produce slightly different floating-point
-    // results vs prefill kernel, but rejection sampling uses argmax (greedy) so the verification
-    // outcome is robust to small numerical differences.
+    // Speculative verification batches have the same shape (bonus + K drafts), but
+    // multi-layer MTP models (e.g. Step3p5) must preserve exact verifier logits.
+    //
+    // Keep the generic verifier path on prefill semantics, but allow the
+    // validated single-layer 2-token verifier case (Qwen3.5 bonus + 1 draft)
+    // to use MTD for throughput.
 #ifndef DISABLE_MULTI_TOKEN_DECODE
+    const bool is_spec_decode_batch = env.at("batch").data<BatchData*>()[0]->spec_decode;
     if (d.decode.n == 0 && d.prefill.n > 0) {
         const int first_input_len = rc[0]->input_len;
         bool uniform = first_input_len > 1 && first_input_len <= 8;
         for (int i = 1; uniform && i < bsz; ++i) {
             uniform = (rc[i]->input_len == first_input_len);
         }
-        if (uniform) {
+        const bool allow_spec_decode_mtd =
+            is_spec_decode_batch && model_param_.num_mtp_layers == 1 && first_input_len == 2;
+        if (uniform && (!is_spec_decode_batch || allow_spec_decode_mtd)) {
             d.multi_token_decode = first_input_len;
             d.decode.n  = bsz;
             d.prefill.n = 0;
