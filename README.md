@@ -1,3 +1,5 @@
+
+
 ### Since 2025Q4, running new open-source models on V100 for inference has become largely impractical — especially prefill performance is painful to watch. As an owner of 8× V100 GPUs, I finally had enough and spent the Spring Festival holiday and spare time afterwards developing this project to solve the pain points that had been bothering me. What a relief!
 This project is developed specifically for V100, based on lmdeploy 0.12.1. It adds support for mainstream open-source models from 2025Q4 to 2026Q1 that I personally wanted to use. No effort has been made to ensure compatibility with other architectures — only verified on 8× V100 32GB. Due to the massive amount of work involved, merging back into the upstream project would be very difficult, so it is released independently first, for fellow V100 owners to enjoy. PRs are welcome.</br>
 Supported models:</br>
@@ -24,10 +26,13 @@ cd lmdeploy-v100
 conda create -n lmdeploy python=3.10 -y
 conda activate lmdeploy
 
-# 3. Install PyTorch (CUDA 11.8 example, adjust for your CUDA version)
+# 3. Install build dependencies (Ubuntu/Debian example)
+sudo apt install cmake ninja-build g++
+
+# 4. Install PyTorch (CUDA 11.8 example, adjust for your CUDA version)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
 
-# 4. Install in development mode (automatically compiles C++/CUDA)
+# 5. Install in development mode (automatically compiles C++/CUDA)
 pip install -e .
 
 # For all optional dependencies:
